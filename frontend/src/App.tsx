@@ -19,7 +19,7 @@ type Result = {
   checks: Record<string, number>;
 };
 
-const API_URL = "const API_URL = "https://upcensus-detector.vercel.app";";
+const API_URL = "https://upcensus-detector.vercel.app/";
 
 const ACCEPTED = ".xlsx,.xls,.csv,.tsv";
 
