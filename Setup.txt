@@ -1,0 +1,52 @@
+# Survey Spreadsheet Validator
+
+React + TypeScript + Tailwind frontend with a Python FastAPI backend.
+
+## Features
+- Upload `.xlsx`, `.xls`, `.csv`, or `.tsv`
+- Detects:
+  - duplicate mobile numbers
+  - invalid Indian mobile numbers
+  - suspicious repeated-digit numbers such as 0000000000 / 1111111111
+  - duplicate outlet/shop names when mobile numbers differ
+  - duplicate image references by filename/reference
+  - screenshot-like image filenames
+  - missing/invalid latitude and longitude
+- Produces one Excel workbook with:
+  - `Correct Data`
+  - `Discard Data`
+- `Discard Data` includes `Discard Reason`.
+
+## Run backend
+
+```bash
+cd backend
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+# source .venv/bin/activate
+
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+## Run frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open the Vite URL shown in the terminal.
+
+## Notes
+The validator uses column names rather than fixed column positions. It recognizes the survey column names from the provided format, including:
+- `Mobile Number`
+- `Outlet Name`
+- `Location [Latitude]`
+- `Location [Longitude]`
+- photo/image columns
+
+The image checks work on image references/filenames present in the spreadsheet. If the spreadsheet contains actual image files only as Excel-embedded objects, those are not available to a CSV/TSV parser and need a separate extraction pipeline.
