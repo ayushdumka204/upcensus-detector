@@ -1,4 +1,4 @@
-from __future__ import annotations
+\from __future__ import annotations
 
 import re
 import uuid
@@ -1055,43 +1055,6 @@ def create_output(
         ].index
     )
 
-    # ========================================================
-    # SHOP DUPLICATES
-    #
-    # Same outlet name
-    # +
-    # different mobile number
-    # ========================================================
-
-    shop_map: dict[
-        str,
-        set[str],
-    ] = {}
-
-    for _, row in df.iterrows():
-
-        shop = normalized_shop(
-            row[outlet_col]
-        )
-
-        mobile = mobile_digits(
-            row[mobile_col]
-        )
-
-        if shop:
-
-            if shop not in shop_map:
-                shop_map[shop] = set()
-
-            shop_map[shop].add(
-                mobile
-            )
-
-    conflicting_shops = {
-        shop
-        for shop, mobiles in shop_map.items()
-        if len(mobiles) > 1
-    }
 
     # ========================================================
     # IMAGE DUPLICATES
@@ -1208,26 +1171,6 @@ def create_output(
                 "Mobile Duplicates"
             ] += 1
 
-        # ----------------------------------------------------
-        # Outlet / Shop
-        # ----------------------------------------------------
-
-        shop = normalized_shop(
-            row[outlet_col]
-        )
-
-        if (
-            shop
-            and shop in conflicting_shops
-        ):
-
-            reasons.append(
-                "Duplicate Shop Name With Different Mobile"
-            )
-
-            counters[
-                "Duplicate Shops"
-            ] += 1
 
         # ----------------------------------------------------
         # Latitude / Longitude
