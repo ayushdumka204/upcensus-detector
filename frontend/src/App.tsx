@@ -125,7 +125,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
-                Survey Spreadsheet Validator
+                Up Census Data Validator
               </h1>
               <p className="text-sm text-slate-400">
                 Upload your survey data and separate valid and problematic records.
