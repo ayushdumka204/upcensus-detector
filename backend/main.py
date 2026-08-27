@@ -37,6 +37,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://upcensus-detector-zph2.vercel.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -1112,6 +1113,7 @@ def create_output(
         "Mobile Duplicates": 0,
         "Invalid Mobile": 0,
         "Suspicious Mobile": 0,
+        "Missing Mobile Number": 0,
             "Duplicate Images": 0,
         "Screenshots": 0,
         "Missing Location": 0,
@@ -1130,11 +1132,25 @@ def create_output(
         # Mobile
         # ----------------------------------------------------
 
+        mobile_value = clean_text(
+            row[mobile_col]
+        )
+
         mobile = mobile_digits(
             row[mobile_col]
         )
 
-        if not valid_indian_mobile(
+        if not mobile_value:
+
+            reasons.append(
+                "Missing Mobile Number"
+            )
+
+            counters[
+                "Missing Mobile Number"
+            ] += 1
+
+        elif not valid_indian_mobile(
             row[mobile_col]
         ):
 
