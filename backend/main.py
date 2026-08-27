@@ -785,6 +785,30 @@ def image_reference(
 # SCREENSHOT DETECTION
 # ============================================================
 
+def image_reason_label(
+    value: Any,
+) -> str:
+
+    text = clean_text(value)
+
+    if not text:
+        return ""
+
+    # Remove the interviewer note from the displayed reason.
+    # Example:
+    # "Photo of the Shop :Note : Interviewer ..."
+    # becomes:
+    # "Photo of the Shop"
+    text = re.split(
+        r"\s*:\s*note\b.*$",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )[0].strip()
+
+    return text.rstrip(" :")
+
+
 def looks_like_screenshot(
     value: Any,
 ) -> bool:
@@ -1252,7 +1276,7 @@ def create_output(
             ):
 
                 reasons.append(
-                    f"Duplicate Image Reference: {image_col}"
+                    f"Duplicate Image Reference: {image_reason_label(image_col)}"
                 )
 
                 counters[
@@ -1267,7 +1291,7 @@ def create_output(
             ):
 
                 reasons.append(
-                    f"Screenshot Image: {image_col}"
+                    f"Screenshot Image: {image_reason_label(image_col)}"
                 )
 
                 counters[
