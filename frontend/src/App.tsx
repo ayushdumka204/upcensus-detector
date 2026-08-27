@@ -235,7 +235,6 @@ export default function App() {
               {[
                 "Indian mobile number format",
                 "Duplicate & suspicious mobile numbers",
-                "Duplicate outlet names",
                 "Duplicate image references",
                 "Screenshot-like image names",
                 "Latitude / longitude presence",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +19,10 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
 
-# Vercel filesystem is read-only except /tmp
-OUTPUT_DIR = Path("/tmp/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================
-# FASTAPI APP
-# ============================================================
 
 app = FastAPI(
     title="Survey Spreadsheet Validator",
@@ -41,7 +37,6 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://upcensus-detector-zph2.vercel.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -101,10 +96,20 @@ IMAGE_HINTS = (
 
 
 # ============================================================
-# TEXT CLEANING
+# TEXT / HEADER NORMALIZATION
 # ============================================================
 
 def clean_text(value: Any) -> str:
+    """
+    Convert any cell value into a clean string.
+
+    Handles:
+    - None
+    - NaN
+    - Excel blank cells
+    - whitespace
+    """
+
     if value is None:
         return ""
 
@@ -117,17 +122,36 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
-# ============================================================
-# COLUMN NAME NORMALIZATION
-# ============================================================
-
 def normalized_column_name(value: Any) -> str:
+    """
+    Aggressively normalizes Excel column headers.
+
+    Example:
+
+        Mobile
+        Number
+
+    becomes:
+
+        mobile number
+
+    Also handles:
+    - \\n
+    - \\r
+    - \\t
+    - non-breaking spaces
+    - BOM
+    - zero-width Unicode characters
+    - punctuation
+    - multiple spaces
+    """
 
     if value is None:
         return ""
 
     text = str(value)
 
+    # Remove invisible Unicode characters
     text = (
         text.replace("\ufeff", "")
         .replace("\u200b", "")
@@ -141,12 +165,22 @@ def normalized_column_name(value: Any) -> str:
 
     text = text.lower().strip()
 
+    # Convert punctuation / symbols into spaces.
+    #
+    # This means:
+    # Mobile-Number
+    # Mobile/Number
+    # Mobile.Number
+    #
+    # all become:
+    # mobile number
     text = re.sub(
         r"[^a-z0-9\u0900-\u097f]+",
         " ",
         text,
     )
 
+    # Remove duplicate spaces
     text = re.sub(
         r"\s+",
         " ",
@@ -164,13 +198,30 @@ def find_column(
     df: pd.DataFrame,
     aliases: set[str],
 ) -> str | None:
+    """
+    Robustly find a column even when Excel contains:
+
+        Mobile
+        Number
+
+    or:
+
+        Mobile Number
+        Mobile-No
+        Mobile No.
+        Contact Number
+        Phone Number
+    """
 
     normalized_aliases = {
         normalized_column_name(alias)
         for alias in aliases
     }
 
-    # Exact match
+    # --------------------------------------------------------
+    # Exact normalized match.
+    # --------------------------------------------------------
+
     for column in df.columns:
 
         normalized = normalized_column_name(
@@ -180,7 +231,10 @@ def find_column(
         if normalized in normalized_aliases:
             return column
 
-    # Token based match
+    # --------------------------------------------------------
+    # Token / semantic fallback.
+    # --------------------------------------------------------
+
     for column in df.columns:
 
         normalized = normalized_column_name(
@@ -215,7 +269,10 @@ def find_column(
         ):
             return column
 
-    # Substring fallback
+    # --------------------------------------------------------
+    # Substring fallback.
+    # --------------------------------------------------------
+
     for column in df.columns:
 
         normalized = normalized_column_name(
@@ -253,14 +310,15 @@ def find_column(
 def find_image_columns(
     df: pd.DataFrame,
 ) -> list[str]:
+    """
+    Detect all image/photo related columns.
+    """
 
     columns: list[str] = []
 
     for column in df.columns:
 
-        name = normalized_column_name(
-            column
-        )
+        name = normalized_column_name(column)
 
         if any(
             hint in name
@@ -278,8 +336,31 @@ def find_image_columns(
 def read_input(
     path: Path,
 ) -> pd.DataFrame:
+    """
+    Read Excel / CSV / TSV and automatically detect the actual
+    survey header row.
+
+    This specifically handles Excel headers such as:
+
+        Mobile
+        Number
+
+    which pandas may read as "Mobile\\nNumber".
+
+    It also handles:
+    - blank/title rows before the header
+    - line breaks
+    - tabs
+    - non-breaking spaces
+    - hidden Unicode characters
+    - CSV / TSV files
+    """
 
     suffix = path.suffix.lower()
+
+    # --------------------------------------------------------
+    # Read without assuming the first row is the header.
+    # --------------------------------------------------------
 
     if suffix in {".xlsx", ".xls"}:
 
@@ -291,11 +372,7 @@ def read_input(
 
     elif suffix in {".csv", ".tsv"}:
 
-        separator = (
-            "\t"
-            if suffix == ".tsv"
-            else ","
-        )
+        separator = "\t" if suffix == ".tsv" else ","
 
         raw_df = pd.read_csv(
             path,
@@ -306,24 +383,20 @@ def read_input(
         ).fillna("")
 
     else:
-
         raise ValueError(
             "Unsupported file type."
         )
 
     if raw_df.empty:
-
         raise ValueError(
             "The uploaded spreadsheet is empty."
         )
 
     # --------------------------------------------------------
-    # Header normalization
+    # Header search normalization.
     # --------------------------------------------------------
 
-    def header_search_text(
-        value: Any,
-    ) -> str:
+    def header_search_text(value: Any) -> str:
 
         if value is None:
             return ""
@@ -362,7 +435,11 @@ def read_input(
         ).strip()
 
     # --------------------------------------------------------
-    # Detect actual survey header
+    # Score the first 50 rows.
+    #
+    # We don't simply search for "Mobile Number", because
+    # some survey sheets have title/description rows before
+    # the real header.
     # --------------------------------------------------------
 
     best_header_row: int | None = None
@@ -373,9 +450,7 @@ def read_input(
         len(raw_df),
     )
 
-    for row_index in range(
-        rows_to_check
-    ):
+    for row_index in range(rows_to_check):
 
         values = [
             header_search_text(value)
@@ -393,8 +468,11 @@ def read_input(
         if not non_empty:
             continue
 
+        row_text = " | ".join(non_empty)
+
         score = 0
 
+        # Strong identifiers for this survey.
         if any(
             "response id" == value
             or "response id" in value
@@ -444,27 +522,29 @@ def read_input(
         ):
             score += 3
 
+        # Prefer rows that actually look like a wide survey
+        # header rather than a random description row.
         if len(non_empty) >= 8:
             score += 2
 
         if score > best_score:
-
             best_score = score
             best_header_row = row_index
 
-    if (
-        best_header_row is None
-        or best_score < 10
-    ):
+    # --------------------------------------------------------
+    # Header not found.
+    # --------------------------------------------------------
+
+    if best_header_row is None or best_score < 10:
 
         raise ValueError(
             "Could not detect the survey header row. "
-            "The spreadsheet must contain a "
-            "'Mobile Number' column/header."
+            "The spreadsheet must contain a 'Mobile Number' "
+            "column/header."
         )
 
     # --------------------------------------------------------
-    # Build headers
+    # Build clean, unique column names.
     # --------------------------------------------------------
 
     raw_headers = raw_df.iloc[
@@ -472,20 +552,17 @@ def read_input(
     ].tolist()
 
     headers: list[str] = []
-
     used_headers: dict[str, int] = {}
 
-    for index, value in enumerate(
-        raw_headers
-    ):
+    for index, value in enumerate(raw_headers):
 
         header = clean_text(value)
 
         if not header:
-            header = (
-                f"Unnamed Column {index + 1}"
-            )
+            header = f"Unnamed Column {index + 1}"
 
+        # Preserve the original visible header, but make
+        # duplicate headers unique so pandas can reference them.
         if header in used_headers:
 
             used_headers[header] += 1
@@ -496,13 +573,12 @@ def read_input(
             )
 
         else:
-
             used_headers[header] = 1
 
         headers.append(header)
 
     # --------------------------------------------------------
-    # Data rows
+    # Data begins immediately after detected header row.
     # --------------------------------------------------------
 
     df = raw_df.iloc[
@@ -511,7 +587,7 @@ def read_input(
 
     df.columns = headers
 
-    # Remove completely blank rows
+    # Remove completely blank rows.
     df = df[
         ~df.apply(
             lambda row: all(
@@ -520,8 +596,45 @@ def read_input(
             ),
             axis=1,
         )
-    ].reset_index(
-        drop=True
+    ].reset_index(drop=True)
+
+    # --------------------------------------------------------
+    # Debug output.
+    # --------------------------------------------------------
+
+    print(
+        "\n========================================"
+    )
+    print(
+        "SURVEY HEADER DETECTION"
+    )
+    print(
+        "========================================"
+    )
+    print(
+        "Detected header row:",
+        best_header_row + 1,
+    )
+    print(
+        "Header detection score:",
+        best_score,
+    )
+
+    for index, column in enumerate(df.columns):
+
+        normalized = normalized_column_name(
+            column
+        )
+
+        print(
+            index,
+            repr(column),
+            "=>",
+            repr(normalized),
+        )
+
+    print(
+        "========================================\n"
     )
 
     return df
@@ -537,14 +650,20 @@ def mobile_digits(
 
     text = clean_text(value)
 
+    # Remove all non-digit characters.
     digits = re.sub(
         r"\D",
         "",
         text,
     )
 
+    # Handle:
+    #
     # +91XXXXXXXXXX
     # 91XXXXXXXXXX
+    #
+    # Convert to:
+    #
     # XXXXXXXXXX
 
     if (
@@ -560,9 +679,7 @@ def valid_indian_mobile(
     value: Any,
 ) -> bool:
 
-    digits = mobile_digits(
-        value
-    )
+    digits = mobile_digits(value)
 
     return bool(
         re.fullmatch(
@@ -576,19 +693,26 @@ def suspicious_mobile(
     value: Any,
 ) -> bool:
 
-    digits = mobile_digits(
-        value
-    )
+    digits = mobile_digits(value)
 
     if len(digits) != 10:
         return False
 
+    # --------------------------------------------------------
+    # All same digit
+    #
     # 0000000000
     # 1111111111
+    # 2222222222
     # etc.
+    # --------------------------------------------------------
 
     if len(set(digits)) == 1:
         return True
+
+    # --------------------------------------------------------
+    # Common fake / test numbers
+    # --------------------------------------------------------
 
     fake_patterns = {
         "0123456789",
@@ -604,23 +728,23 @@ def suspicious_mobile(
 
 
 # ============================================================
-# SHOP NAME
+# SHOP NAME NORMALIZATION
 # ============================================================
 
 def normalized_shop(
     value: Any,
 ) -> str:
 
-    text = clean_text(
-        value
-    ).lower()
+    text = clean_text(value).lower()
 
+    # Remove punctuation
     text = re.sub(
         r"[^a-z0-9\u0900-\u097f]+",
         " ",
         text,
     )
 
+    # Multiple spaces
     text = re.sub(
         r"\s+",
         " ",
@@ -638,15 +762,15 @@ def image_reference(
     value: Any,
 ) -> str:
 
-    text = clean_text(
-        value
-    )
+    text = clean_text(value)
 
     if not text:
         return ""
 
+    # Normalize case
     text = text.lower().strip()
 
+    # Remove surrounding spaces
     text = re.sub(
         r"\s+",
         " ",
@@ -664,9 +788,7 @@ def looks_like_screenshot(
     value: Any,
 ) -> bool:
 
-    text = clean_text(
-        value
-    ).lower()
+    text = clean_text(value).lower()
 
     if not text:
         return False
@@ -701,9 +823,7 @@ def numeric_value(
     value: Any,
 ) -> float | None:
 
-    text = clean_text(
-        value
-    )
+    text = clean_text(value)
 
     if not text:
         return None
@@ -727,15 +847,16 @@ def format_worksheet(
     worksheet: Any,
 ) -> None:
 
+    # Freeze first row
     worksheet.freeze_panes = "A2"
 
+    # Filter
     if worksheet.max_row > 1:
-
         worksheet.auto_filter.ref = (
             worksheet.dimensions
         )
 
-    # Header
+    # Header formatting
     for cell in worksheet[1]:
 
         cell.font = Font(
@@ -754,13 +875,12 @@ def format_worksheet(
             wrap_text=True,
         )
 
-    worksheet.row_dimensions[
-        1
-    ].height = 42
+    # Header height
+    worksheet.row_dimensions[1].height = 42
 
-    # Data
+    # Data alignment
     for row in worksheet.iter_rows(
-        min_row=2
+        min_row=2,
     ):
 
         for cell in row:
@@ -770,17 +890,16 @@ def format_worksheet(
                 wrap_text=True,
             )
 
-    # Column width
+    # Auto width
     for column_cells in worksheet.columns:
 
-        column_letter = (
-            get_column_letter(
-                column_cells[0].column
-            )
+        column_letter = get_column_letter(
+            column_cells[0].column
         )
 
         max_length = 0
 
+        # Limit scanning for performance
         for cell in column_cells[:300]:
 
             value = (
@@ -816,6 +935,10 @@ def create_output(
     output_path: Path,
 ) -> dict[str, Any]:
 
+    # --------------------------------------------------------
+    # FIND IMPORTANT COLUMNS
+    # --------------------------------------------------------
+
     mobile_col = find_column(
         df,
         MOBILE_ALIASES,
@@ -836,12 +959,47 @@ def create_output(
         LON_ALIASES,
     )
 
-    image_cols = find_image_columns(
-        df
+    image_cols = find_image_columns(df)
+
+    # --------------------------------------------------------
+    # Detection diagnostic
+    # --------------------------------------------------------
+
+    print(
+        "\n========================================"
+    )
+    print(
+        "IMPORTANT COLUMN DETECTION"
+    )
+    print(
+        "========================================"
+    )
+    print(
+        "Mobile Number:",
+        repr(mobile_col),
+    )
+    print(
+        "Outlet Name:",
+        repr(outlet_col),
+    )
+    print(
+        "Latitude:",
+        repr(lat_col),
+    )
+    print(
+        "Longitude:",
+        repr(lon_col),
+    )
+    print(
+        "Image Columns:",
+        [repr(column) for column in image_cols],
+    )
+    print(
+        "========================================\n"
     )
 
     # --------------------------------------------------------
-    # Required columns
+    # Validate required columns
     # --------------------------------------------------------
 
     if mobile_col is None:
@@ -854,9 +1012,7 @@ def create_output(
         raise ValueError(
             "Could not find the 'Mobile Number' column. "
             "Detected columns: "
-            + ", ".join(
-                detected_columns[:80]
-            )
+            + ", ".join(detected_columns[:80])
         )
 
     if outlet_col is None:
@@ -878,15 +1034,13 @@ def create_output(
             "Could not find the Longitude column."
         )
 
-    # --------------------------------------------------------
-    # Duplicate mobile numbers
-    # --------------------------------------------------------
+    # ========================================================
+    # MOBILE DUPLICATES
+    # ========================================================
 
     mobile_series = df[
         mobile_col
-    ].map(
-        mobile_digits
-    )
+    ].map(mobile_digits)
 
     mobile_counts = (
         mobile_series[
@@ -901,9 +1055,13 @@ def create_output(
         ].index
     )
 
-    # --------------------------------------------------------
-    # Duplicate shops with different mobiles
-    # --------------------------------------------------------
+    # ========================================================
+    # SHOP DUPLICATES
+    #
+    # Same outlet name
+    # +
+    # different mobile number
+    # ========================================================
 
     shop_map: dict[
         str,
@@ -922,23 +1080,22 @@ def create_output(
 
         if shop:
 
-            shop_map.setdefault(
-                shop,
-                set(),
-            ).add(
+            if shop not in shop_map:
+                shop_map[shop] = set()
+
+            shop_map[shop].add(
                 mobile
             )
 
     conflicting_shops = {
         shop
-        for shop, mobiles
-        in shop_map.items()
+        for shop, mobiles in shop_map.items()
         if len(mobiles) > 1
     }
 
-    # --------------------------------------------------------
-    # Duplicate image references
-    # --------------------------------------------------------
+    # ========================================================
+    # IMAGE DUPLICATES
+    # ========================================================
 
     image_occurrences: dict[
         str,
@@ -972,9 +1129,9 @@ def create_output(
         if count > 1
     }
 
-    # --------------------------------------------------------
-    # Containers
-    # --------------------------------------------------------
+    # ========================================================
+    # RESULT CONTAINERS
+    # ========================================================
 
     correct_rows: list[
         dict[str, Any]
@@ -983,6 +1140,10 @@ def create_output(
     discarded_rows: list[
         dict[str, Any]
     ] = []
+
+    # ========================================================
+    # COUNTERS
+    # ========================================================
 
     counters = {
         "Mobile Duplicates": 0,
@@ -995,15 +1156,18 @@ def create_output(
         "Invalid Coordinates": 0,
     }
 
-    # --------------------------------------------------------
-    # Process rows
-    # --------------------------------------------------------
+    # ========================================================
+    # PROCESS EVERY ROW
+    # ========================================================
 
     for _, row in df.iterrows():
 
         reasons: list[str] = []
 
+        # ----------------------------------------------------
         # Mobile
+        # ----------------------------------------------------
+
         mobile = mobile_digits(
             row[mobile_col]
         )
@@ -1045,7 +1209,10 @@ def create_output(
                 "Mobile Duplicates"
             ] += 1
 
-        # Shop
+        # ----------------------------------------------------
+        # Outlet / Shop
+        # ----------------------------------------------------
+
         shop = normalized_shop(
             row[outlet_col]
         )
@@ -1063,7 +1230,10 @@ def create_output(
                 "Duplicate Shops"
             ] += 1
 
-        # Location
+        # ----------------------------------------------------
+        # Latitude / Longitude
+        # ----------------------------------------------------
+
         lat = numeric_value(
             row[lat_col]
         )
@@ -1108,7 +1278,10 @@ def create_output(
                     "Invalid Coordinates"
                 ] += 1
 
+        # ----------------------------------------------------
         # Images
+        # ----------------------------------------------------
+
         for image_col in image_cols:
 
             reference = image_reference(
@@ -1143,17 +1316,23 @@ def create_output(
                     "Screenshots"
                 ] += 1
 
-        # Preserve original row
+        # ----------------------------------------------------
+        # Preserve original data
+        # ----------------------------------------------------
+
         base = {
             str(column): row[column]
             for column in df.columns
         }
 
+        # Remove duplicate reasons
         unique_reasons = list(
-            dict.fromkeys(
-                reasons
-            )
+            dict.fromkeys(reasons)
         )
+
+        # ----------------------------------------------------
+        # Correct or Discard
+        # ----------------------------------------------------
 
         if unique_reasons:
 
@@ -1173,9 +1352,9 @@ def create_output(
                 base
             )
 
-    # --------------------------------------------------------
-    # DataFrames
-    # --------------------------------------------------------
+    # ========================================================
+    # DATAFRAMES
+    # ========================================================
 
     original_columns = [
         str(column)
@@ -1195,9 +1374,9 @@ def create_output(
         ],
     )
 
-    # --------------------------------------------------------
-    # Create XLSX
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE EXCEL
+    # ========================================================
 
     with pd.ExcelWriter(
         output_path,
@@ -1218,7 +1397,10 @@ def create_output(
 
         workbook = writer.book
 
-        # Correct Data
+        # ----------------------------------------------------
+        # Format Correct Data
+        # ----------------------------------------------------
+
         correct_sheet = workbook[
             "Correct Data"
         ]
@@ -1227,7 +1409,10 @@ def create_output(
             correct_sheet
         )
 
-        # Discard Data
+        # ----------------------------------------------------
+        # Format Discard Data
+        # ----------------------------------------------------
+
         discard_sheet = workbook[
             "Discard Data"
         ]
@@ -1236,7 +1421,10 @@ def create_output(
             discard_sheet
         )
 
-        # Discard reason highlighting
+        # ----------------------------------------------------
+        # Highlight Discard Reason
+        # ----------------------------------------------------
+
         if discard_sheet.max_column > 0:
 
             discard_reason_column = (
@@ -1263,7 +1451,11 @@ def create_output(
                     bold=True,
                 )
 
-        # Correct row highlighting
+        # ----------------------------------------------------
+        # Highlight Correct Data status
+        # ----------------------------------------------------
+
+        # Add green visual formatting to Correct Data rows.
         for row_number in range(
             2,
             correct_sheet.max_row + 1,
@@ -1277,6 +1469,10 @@ def create_output(
                     fill_type="solid",
                     fgColor="F0FDF4",
                 )
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
 
     return {
         "total_rows": len(df),
@@ -1341,6 +1537,10 @@ async def validate(
         .lower()
     )
 
+    # --------------------------------------------------------
+    # Validate extension
+    # --------------------------------------------------------
+
     allowed_extensions = {
         ".xlsx",
         ".xls",
@@ -1359,7 +1559,7 @@ async def validate(
         )
 
     # --------------------------------------------------------
-    # Temporary files
+    # Create temporary paths
     # --------------------------------------------------------
 
     job_id = uuid.uuid4().hex
@@ -1379,6 +1579,10 @@ async def validate(
         OUTPUT_DIR
         / output_name
     )
+
+    # --------------------------------------------------------
+    # Process
+    # --------------------------------------------------------
 
     try:
 
@@ -1412,7 +1616,6 @@ async def validate(
     except Exception as exc:
 
         if output_path.exists():
-
             output_path.unlink()
 
         raise HTTPException(
@@ -1423,7 +1626,6 @@ async def validate(
     finally:
 
         if input_path.exists():
-
             input_path.unlink()
 
 
@@ -1437,6 +1639,9 @@ async def validate(
 def download(
     filename: str,
 ) -> FileResponse:
+
+    # Security:
+    # only use the filename, not any supplied path.
 
     safe_name = Path(
         filename
