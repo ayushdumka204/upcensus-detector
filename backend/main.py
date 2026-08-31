@@ -1,6 +1,5 @@
-from __future__ import annotations
 
-import difflib
+
 import re
 import uuid
 from pathlib import Path
@@ -97,10 +96,7 @@ IMAGE_HINTS = (
     "screenshot",
 )
 
-
-# These response metadata columns are NEVER cleaned, corrected,
-# title-cased, Hindi-checked, or highlighted as changed.
-# Their values must remain exactly as they appeared in the input.
+# These metadata columns are NEVER cleaned, corrected, or Hindi-checked.
 PROTECTED_METADATA_ALIASES = {
     "response id",
     "response start time",
@@ -108,6 +104,9 @@ PROTECTED_METADATA_ALIASES = {
     "ip address",
     "collector name",
 }
+
+def is_protected_metadata_column(column: Any) -> bool:
+    return normalized_column_name(column) in PROTECTED_METADATA_ALIASES
 
 
 # ============================================================
@@ -161,141 +160,6 @@ def normalized_column_name(value: Any) -> str:
         " ",
         text,
     ).strip()
-
-
-def is_protected_metadata_column(column: Any) -> bool:
-    """Return True for response metadata columns that must stay untouched."""
-
-    return (
-        normalized_column_name(column)
-        in PROTECTED_METADATA_ALIASES
-    )
-
-
-def correction_key(value: Any) -> str:
-    """Normalize a text value for fuzzy spelling comparison."""
-
-    text = clean_text(value).lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def best_reference_correction(
-    value: Any,
-    candidates: list[Any],
-) -> Any:
-    """
-    Prefer a clearly matching value already present in the same
-    spreadsheet. This helps correct misspellings such as:
-
-        Relwway Stesion -> Railway Station
-        Bindki Men Road -> Bindki Main Road
-
-    Only strong matches are accepted, so arbitrary short values are
-    not replaced.
-    """
-
-    original = clean_text(value)
-
-    if (
-        not original
-        or contains_hindi(original)
-        or len(original) < 5
-    ):
-        return value
-
-    key = correction_key(original)
-
-    if not key:
-        return value
-
-    best_value: Any = value
-    best_score = 0.0
-
-    seen: set[str] = set()
-
-    for candidate in candidates:
-
-        candidate_text = clean_text(candidate)
-
-        if (
-            not candidate_text
-            or contains_hindi(candidate_text)
-            or candidate_text.lower() == original.lower()
-            or len(candidate_text) < 5
-        ):
-            continue
-
-        candidate_key = correction_key(candidate_text)
-
-        if (
-            not candidate_key
-            or candidate_key in seen
-        ):
-            continue
-
-        seen.add(candidate_key)
-
-        # Avoid matching values that are wildly different in size.
-        length_ratio = min(
-            len(key),
-            len(candidate_key),
-        ) / max(
-            len(key),
-            len(candidate_key),
-        )
-
-        if length_ratio < 0.70:
-            continue
-
-        whole_score = difflib.SequenceMatcher(
-            None,
-            key,
-            candidate_key,
-        ).ratio()
-
-        original_words = key.split()
-        candidate_words = candidate_key.split()
-
-        # Word-level similarity is useful for real-world typos where
-        # several words are individually close but the whole sentence
-        # score becomes lower because of transposed/misspelled letters.
-        word_scores: list[float] = []
-
-        for original_word in original_words:
-            if not candidate_words:
-                break
-
-            word_scores.append(
-                max(
-                    difflib.SequenceMatcher(
-                        None,
-                        original_word,
-                        candidate_word,
-                    ).ratio()
-                    for candidate_word in candidate_words
-                )
-            )
-
-        average_word_score = (
-            sum(word_scores) / len(word_scores)
-            if word_scores
-            else 0.0
-        )
-
-        score = max(
-            whole_score,
-            average_word_score,
-        )
-
-        if score > best_score:
-            best_score = score
-            best_value = candidate_text
-
-    if best_score >= 0.70:
-        return best_value
-
-    return value
 
 
 def title_case_value(value: Any) -> Any:
@@ -1118,8 +982,6 @@ def create_output(
         dict[str, Any]
     ] = []
 
-    # Keep source row indexes so Excel formatting can be applied
-    # directly without repeatedly searching the output sheet.
     correct_row_indexes: list[int] = []
     discarded_row_indexes: list[int] = []
 
@@ -1409,11 +1271,10 @@ def create_output(
                 original_value
             )
 
-            # Never alter response metadata, mobile numbers,
+            # Never alter mobile numbers,
             # coordinates or image references.
             special_column = (
-                is_protected_metadata_column(column)
-                or column == mobile_col
+                column == mobile_col
                 or column == lat_col
                 or column == lon_col
                 or column in image_cols
@@ -1422,30 +1283,17 @@ def create_output(
             if (
                 original_text
                 and not special_column
-                and not is_protected_metadata_column(
-                    column
-                )
+                and not is_protected_metadata_column(column)
                 and not contains_hindi(
                     original_text
                 )
             ):
 
-                # First use a strong same-sheet reference value when
-                # one exists; otherwise apply normal title casing.
-                same_column_candidates = [
-                    row[column]
-                    for _, row in df.iterrows()
-                ]
-
-                corrected_value = best_reference_correction(
-                    original_text,
-                    same_column_candidates,
-                )
-
-                if clean_text(corrected_value).lower() == original_text.lower():
-                    corrected_value = title_case_value(
+                corrected_value = (
+                    title_case_value(
                         original_text
                     )
+                )
 
                 base[
                     column_name
@@ -1502,18 +1350,14 @@ def create_output(
             discarded_rows.append(
                 base
             )
-            discarded_row_indexes.append(
-                row_index
-            )
+            discarded_row_indexes.append(row_index)
 
         else:
 
             correct_rows.append(
                 base
             )
-            correct_row_indexes.append(
-                row_index
-            )
+            correct_row_indexes.append(row_index)
 
     # ========================================================
     # DATAFRAMES
@@ -1649,17 +1493,8 @@ def create_output(
             color="9C0006",
         )
 
-        # ----------------------------------------------------
-        # Apply cell highlighting using direct source-index maps.
-        #
-        # The previous implementation searched the entire Discard
-        # sheet for every source row. That became O(n²) and could
-        # exceed Vercel's 300-second execution limit.
-        #
-        # These maps are O(n) and preserve the exact source/output
-        # order.
-        # ----------------------------------------------------
-
+        # Direct source-index -> output-row maps.
+        # This avoids repeatedly scanning the Discard sheet.
         correct_output_row_by_source = {
             source_index: output_row
             for output_row, source_index in enumerate(
@@ -1680,39 +1515,34 @@ def create_output(
 
             if row_index in discard_output_row_by_source:
                 target_sheet = discard_sheet
-                target_row = discard_output_row_by_source[
-                    row_index
-                ]
+                target_row = discard_output_row_by_source[row_index]
             else:
                 target_sheet = correct_sheet
-                target_row = correct_output_row_by_source.get(
-                    row_index
-                )
+                target_row = correct_output_row_by_source.get(row_index)
 
             if target_row is None:
                 continue
 
             changed_columns = changed_columns_by_row.get(
-                row_index,
-                set(),
+                row_index, set()
             )
-
             red_columns = red_columns_by_row.get(
-                row_index,
-                set(),
+                row_index, set()
             )
 
             for column_index, column in enumerate(
-                original_columns,
-                start=1,
+                original_columns, start=1
             ):
+                column_name = str(column)
+
+                # Metadata columns remain untouched by validation highlighting.
+                if is_protected_metadata_column(column):
+                    continue
 
                 cell = target_sheet.cell(
                     row=target_row,
                     column=column_index,
                 )
-
-                column_name = str(column)
 
                 if column_name in changed_columns:
                     cell.fill = yellow_fill
