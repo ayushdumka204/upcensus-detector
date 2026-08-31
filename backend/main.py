@@ -1118,6 +1118,11 @@ def create_output(
         dict[str, Any]
     ] = []
 
+    # Keep source row indexes so Excel formatting can be applied
+    # directly without repeatedly searching the output sheet.
+    correct_row_indexes: list[int] = []
+    discarded_row_indexes: list[int] = []
+
     # Store formatting information by original dataframe index.
     changed_columns_by_row: dict[
         int,
@@ -1417,6 +1422,9 @@ def create_output(
             if (
                 original_text
                 and not special_column
+                and not is_protected_metadata_column(
+                    column
+                )
                 and not contains_hindi(
                     original_text
                 )
@@ -1494,11 +1502,17 @@ def create_output(
             discarded_rows.append(
                 base
             )
+            discarded_row_indexes.append(
+                row_index
+            )
 
         else:
 
             correct_rows.append(
                 base
+            )
+            correct_row_indexes.append(
+                row_index
             )
 
     # ========================================================
@@ -1635,175 +1649,58 @@ def create_output(
             color="9C0006",
         )
 
-        # Map dataframe row index -> output row number.
-        # Rows are appended in original order within each sheet.
-        correct_output_row = 2
+        # ----------------------------------------------------
+        # Apply cell highlighting using direct source-index maps.
+        #
+        # The previous implementation searched the entire Discard
+        # sheet for every source row. That became O(n²) and could
+        # exceed Vercel's 300-second execution limit.
+        #
+        # These maps are O(n) and preserve the exact source/output
+        # order.
+        # ----------------------------------------------------
 
-        for row_index, row in df.iterrows():
-
-            reasons_exist = bool(
-                # Determine whether this row was discarded
-                # using the same logic stored in the result lists.
-                any(
-                    clean_text(
-                        row[column]
-                    )
-                    for column in df.columns
-                    if False
-                )
+        correct_output_row_by_source = {
+            source_index: output_row
+            for output_row, source_index in enumerate(
+                correct_row_indexes,
+                start=2,
             )
+        }
 
-            # A simpler reliable test:
-            # latitude/longitude are never discard reasons;
-            # inspect the generated discard row IDs by order.
-            row_was_discarded = False
-
-            # Reconstruct the discard decision from the output
-            # by matching the row's Response ID when available.
-            response_col = find_column(
-                df,
-                {"response id"},
+        discard_output_row_by_source = {
+            source_index: output_row
+            for output_row, source_index in enumerate(
+                discarded_row_indexes,
+                start=2,
             )
+        }
 
-            if response_col is not None:
-                response_value = clean_text(
-                    row[response_col]
-                )
+        for row_index in range(len(df)):
 
-                if response_value:
-                    for discard_row_number in range(
-                        2,
-                        discard_sheet.max_row + 1,
-                    ):
-                        discard_response = clean_text(
-                            discard_sheet.cell(
-                                row=discard_row_number,
-                                column=(
-                                    original_columns.index(
-                                        str(response_col)
-                                    ) + 1
-                                ),
-                            ).value
-                        )
-
-                        if (
-                            discard_response
-                            == response_value
-                        ):
-                            row_was_discarded = True
-                            break
-
-            # If no Response ID exists, use the generated row
-            # content to determine membership.
-            if (
-                response_col is None
-                or not clean_text(
-                    row[response_col]
-                )
-            ):
-                row_was_discarded = any(
-                    str(
-                        discarded_row.get(
-                            "Discard Reason",
-                            ""
-                        )
-                    )
-                    for discarded_row in discarded_rows
-                    if all(
-                        clean_text(
-                            discarded_row.get(
-                                str(column),
-                            )
-                        )
-                        == clean_text(
-                            row[column]
-                        )
-                        for column in df.columns
-                    )
-                )
-
-            target_sheet = (
-                discard_sheet
-                if row_was_discarded
-                else correct_sheet
-            )
-
-            target_row = None
-
-            if row_was_discarded:
-
-                # Find the matching row by all original values.
-                for candidate in range(
-                    2,
-                    discard_sheet.max_row + 1,
-                ):
-
-                    matches = True
-
-                    for column_index, column in enumerate(
-                        original_columns,
-                        start=1,
-                    ):
-
-                        source_value = clean_text(
-                            row[column]
-                        )
-
-                        output_value = clean_text(
-                            discard_sheet.cell(
-                                row=candidate,
-                                column=column_index,
-                            ).value
-                        )
-
-                        # For corrected non-special values, compare
-                        # against title-cased output.
-                        if (
-                            column
-                            in changed_columns_by_row.get(
-                                row_index,
-                                set(),
-                            )
-                        ):
-
-                            candidate_values = [
-                                source_row[column]
-                                for _, source_row in df.iterrows()
-                            ]
-
-                            corrected_expected = best_reference_correction(
-                                source_value,
-                                candidate_values,
-                            )
-
-                            if clean_text(corrected_expected).lower() == source_value.lower():
-                                corrected_expected = title_case_value(
-                                    source_value
-                                )
-
-                            expected = clean_text(
-                                corrected_expected
-                            )
-
-                        else:
-                            expected = source_value
-
-                        if output_value != expected:
-                            matches = False
-                            break
-
-                    if matches:
-                        target_row = candidate
-                        break
-
+            if row_index in discard_output_row_by_source:
+                target_sheet = discard_sheet
+                target_row = discard_output_row_by_source[
+                    row_index
+                ]
             else:
-
-                # Correct rows preserve original order.
-                target_row = correct_output_row
-                correct_output_row += 1
+                target_sheet = correct_sheet
+                target_row = correct_output_row_by_source.get(
+                    row_index
+                )
 
             if target_row is None:
                 continue
+
+            changed_columns = changed_columns_by_row.get(
+                row_index,
+                set(),
+            )
+
+            red_columns = red_columns_by_row.get(
+                row_index,
+                set(),
+            )
 
             for column_index, column in enumerate(
                 original_columns,
@@ -1815,22 +1712,12 @@ def create_output(
                     column=column_index,
                 )
 
-                column_name = str(
-                    column
-                )
+                column_name = str(column)
 
-                if column_name in changed_columns_by_row.get(
-                    row_index,
-                    set(),
-                ):
-
+                if column_name in changed_columns:
                     cell.fill = yellow_fill
 
-                if column_name in red_columns_by_row.get(
-                    row_index,
-                    set(),
-                ):
-
+                if column_name in red_columns:
                     cell.fill = red_fill
                     cell.font = red_font
 
