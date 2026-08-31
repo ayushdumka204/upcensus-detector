@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import uuid
-from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +18,10 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = Path("/tmp/outputs")
 
+# Vercel's deployed filesystem is read-only.
+# /tmp is the writable directory.
+OUTPUT_DIR = Path("/tmp/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -97,20 +98,13 @@ IMAGE_HINTS = (
 
 
 # ============================================================
-# TEXT / HEADER NORMALIZATION
+# TEXT HELPERS
 # ============================================================
 
+HINDI_RE = re.compile(r"[\u0900-\u097F]")
+
+
 def clean_text(value: Any) -> str:
-    """
-    Convert any cell value into a clean string.
-
-    Handles:
-    - None
-    - NaN
-    - Excel blank cells
-    - whitespace
-    """
-
     if value is None:
         return ""
 
@@ -123,41 +117,18 @@ def clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def contains_hindi(value: Any) -> bool:
+    return bool(HINDI_RE.search(clean_text(value)))
+
+
 def normalized_column_name(value: Any) -> str:
-    """
-    Aggressively normalizes Excel column headers.
+    text = clean_text(value)
 
-    Example:
-
-        Mobile
-        Number
-
-    becomes:
-
-        mobile number
-
-    Also handles:
-    - \\n
-    - \\r
-    - \\t
-    - non-breaking spaces
-    - BOM
-    - zero-width Unicode characters
-    - punctuation
-    - multiple spaces
-    """
-
-    if value is None:
-        return ""
-
-    text = str(value)
-
-    # Remove invisible Unicode characters
     text = (
-        text.replace("\ufeff", "")
-        .replace("\u200b", "")
-        .replace("\u200c", "")
-        .replace("\u200d", "")
+        text.replace("\ufeff", " ")
+        .replace("\u200b", " ")
+        .replace("\u200c", " ")
+        .replace("\u200d", " ")
         .replace("\xa0", " ")
         .replace("\r", " ")
         .replace("\n", " ")
@@ -166,29 +137,40 @@ def normalized_column_name(value: Any) -> str:
 
     text = text.lower().strip()
 
-    # Convert punctuation / symbols into spaces.
-    #
-    # This means:
-    # Mobile-Number
-    # Mobile/Number
-    # Mobile.Number
-    #
-    # all become:
-    # mobile number
     text = re.sub(
         r"[^a-z0-9\u0900-\u097f]+",
         " ",
         text,
     )
 
-    # Remove duplicate spaces
-    text = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         text,
     ).strip()
 
-    return text
+
+def title_case_value(value: Any) -> Any:
+    """
+    Correct ordinary Latin text to normal title case.
+
+    Hindi/Devanagari text is deliberately not changed because
+    Hindi rows are discarded separately.
+    """
+
+    text = clean_text(value)
+
+    if not text or contains_hindi(text):
+        return value
+
+    return re.sub(
+        r"\b([A-Za-z])([A-Za-z']*)\b",
+        lambda match: (
+            match.group(1).upper()
+            + match.group(2).lower()
+        ),
+        text,
+    )
 
 
 # ============================================================
@@ -199,86 +181,39 @@ def find_column(
     df: pd.DataFrame,
     aliases: set[str],
 ) -> str | None:
-    """
-    Robustly find a column even when Excel contains:
-
-        Mobile
-        Number
-
-    or:
-
-        Mobile Number
-        Mobile-No
-        Mobile No.
-        Contact Number
-        Phone Number
-    """
 
     normalized_aliases = {
         normalized_column_name(alias)
         for alias in aliases
     }
 
-    # --------------------------------------------------------
     # Exact normalized match.
-    # --------------------------------------------------------
-
     for column in df.columns:
-
-        normalized = normalized_column_name(
-            column
-        )
+        normalized = normalized_column_name(column)
 
         if normalized in normalized_aliases:
             return column
 
-    # --------------------------------------------------------
-    # Token / semantic fallback.
-    # --------------------------------------------------------
-
+    # Token fallback.
     for column in df.columns:
+        normalized = normalized_column_name(column)
+        words = set(normalized.split())
 
-        normalized = normalized_column_name(
-            column
-        )
-
-        words = set(
-            normalized.split()
-        )
-
-        if (
-            "mobile" in words
-            and "number" in words
-        ):
+        if "mobile" in words and "number" in words:
             return column
 
-        if (
-            "mobile" in words
-            and "no" in words
-        ):
+        if "mobile" in words and "no" in words:
             return column
 
-        if (
-            "contact" in words
-            and "number" in words
-        ):
+        if "contact" in words and "number" in words:
             return column
 
-        if (
-            "phone" in words
-            and "number" in words
-        ):
+        if "phone" in words and "number" in words:
             return column
 
-    # --------------------------------------------------------
     # Substring fallback.
-    # --------------------------------------------------------
-
     for column in df.columns:
-
-        normalized = normalized_column_name(
-            column
-        )
+        normalized = normalized_column_name(column)
 
         if (
             "mobile" in normalized
@@ -301,6 +236,16 @@ def find_column(
         ):
             return column
 
+    # Generic alias fallback.
+    for column in df.columns:
+        normalized = normalized_column_name(column)
+
+        if any(
+            alias in normalized
+            for alias in normalized_aliases
+        ):
+            return column
+
     return None
 
 
@@ -311,14 +256,10 @@ def find_column(
 def find_image_columns(
     df: pd.DataFrame,
 ) -> list[str]:
-    """
-    Detect all image/photo related columns.
-    """
 
     columns: list[str] = []
 
     for column in df.columns:
-
         name = normalized_column_name(column)
 
         if any(
@@ -330,6 +271,18 @@ def find_image_columns(
     return columns
 
 
+def is_shop_image_column(
+    column: Any,
+) -> bool:
+
+    normalized = normalized_column_name(column)
+
+    return (
+        "shop" in normalized
+        or "outlet" in normalized
+    )
+
+
 # ============================================================
 # INPUT FILE READER
 # ============================================================
@@ -337,34 +290,14 @@ def find_image_columns(
 def read_input(
     path: Path,
 ) -> pd.DataFrame:
-    """
-    Read Excel / CSV / TSV and automatically detect the actual
-    survey header row.
-
-    This specifically handles Excel headers such as:
-
-        Mobile
-        Number
-
-    which pandas may read as "Mobile\\nNumber".
-
-    It also handles:
-    - blank/title rows before the header
-    - line breaks
-    - tabs
-    - non-breaking spaces
-    - hidden Unicode characters
-    - CSV / TSV files
-    """
 
     suffix = path.suffix.lower()
 
     # --------------------------------------------------------
-    # Read without assuming the first row is the header.
+    # Read without assuming first row is header.
     # --------------------------------------------------------
 
     if suffix in {".xlsx", ".xls"}:
-
         raw_df = pd.read_excel(
             path,
             dtype=str,
@@ -372,8 +305,11 @@ def read_input(
         ).fillna("")
 
     elif suffix in {".csv", ".tsv"}:
-
-        separator = "\t" if suffix == ".tsv" else ","
+        separator = (
+            "\t"
+            if suffix == ".tsv"
+            else ","
+        )
 
         raw_df = pd.read_csv(
             path,
@@ -394,21 +330,14 @@ def read_input(
         )
 
     # --------------------------------------------------------
-    # Header search normalization.
+    # Header normalization.
     # --------------------------------------------------------
 
-    def header_search_text(value: Any) -> str:
+    def header_search_text(
+        value: Any,
+    ) -> str:
 
-        if value is None:
-            return ""
-
-        try:
-            if pd.isna(value):
-                return ""
-        except (TypeError, ValueError):
-            pass
-
-        text = str(value)
+        text = clean_text(value)
 
         text = (
             text.replace("\ufeff", " ")
@@ -421,7 +350,7 @@ def read_input(
             .replace("\t", " ")
         )
 
-        text = text.lower().strip()
+        text = text.lower()
 
         text = re.sub(
             r"[^a-z0-9]+",
@@ -436,11 +365,7 @@ def read_input(
         ).strip()
 
     # --------------------------------------------------------
-    # Score the first 50 rows.
-    #
-    # We don't simply search for "Mobile Number", because
-    # some survey sheets have title/description rows before
-    # the real header.
+    # Detect the real header row.
     # --------------------------------------------------------
 
     best_header_row: int | None = None
@@ -469,13 +394,10 @@ def read_input(
         if not non_empty:
             continue
 
-        row_text = " | ".join(non_empty)
-
         score = 0
 
-        # Strong identifiers for this survey.
         if any(
-            "response id" == value
+            value == "response id"
             or "response id" in value
             for value in non_empty
         ):
@@ -523,8 +445,6 @@ def read_input(
         ):
             score += 3
 
-        # Prefer rows that actually look like a wide survey
-        # header rather than a random description row.
         if len(non_empty) >= 8:
             score += 2
 
@@ -532,12 +452,10 @@ def read_input(
             best_score = score
             best_header_row = row_index
 
-    # --------------------------------------------------------
-    # Header not found.
-    # --------------------------------------------------------
-
-    if best_header_row is None or best_score < 10:
-
+    if (
+        best_header_row is None
+        or best_score < 10
+    ):
         raise ValueError(
             "Could not detect the survey header row. "
             "The spreadsheet must contain a 'Mobile Number' "
@@ -545,97 +463,64 @@ def read_input(
         )
 
     # --------------------------------------------------------
-    # Build clean, unique column names.
+    # Build dataframe using the detected header.
     # --------------------------------------------------------
 
-    raw_headers = raw_df.iloc[
-        best_header_row
-    ].tolist()
+    header_values = [
+        clean_text(value)
+        for value in raw_df.iloc[
+            best_header_row
+        ].tolist()
+    ]
 
-    headers: list[str] = []
+    # Make duplicate/blank headers safe.
     used_headers: dict[str, int] = {}
+    final_headers: list[str] = []
 
-    for index, value in enumerate(raw_headers):
+    for index, value in enumerate(
+        header_values
+    ):
 
-        header = clean_text(value)
+        header = value or f"Column {index + 1}"
 
-        if not header:
-            header = f"Unnamed Column {index + 1}"
+        count = used_headers.get(
+            header,
+            0,
+        )
 
-        # Preserve the original visible header, but make
-        # duplicate headers unique so pandas can reference them.
-        if header in used_headers:
-
-            used_headers[header] += 1
-
-            header = (
-                f"{header} "
-                f"({used_headers[header]})"
+        if count:
+            final_header = (
+                f"{header}_{count + 1}"
             )
-
         else:
-            used_headers[header] = 1
+            final_header = header
 
-        headers.append(header)
-
-    # --------------------------------------------------------
-    # Data begins immediately after detected header row.
-    # --------------------------------------------------------
+        used_headers[header] = count + 1
+        final_headers.append(final_header)
 
     df = raw_df.iloc[
         best_header_row + 1:
     ].copy()
 
-    df.columns = headers
+    df.columns = final_headers
 
-    # Remove completely blank rows.
-    df = df[
-        ~df.apply(
-            lambda row: all(
-                clean_text(value) == ""
-                for value in row
-            ),
-            axis=1,
-        )
-    ].reset_index(drop=True)
-
-    # --------------------------------------------------------
-    # Debug output.
-    # --------------------------------------------------------
-
-    print(
-        "\n========================================"
-    )
-    print(
-        "SURVEY HEADER DETECTION"
-    )
-    print(
-        "========================================"
-    )
-    print(
-        "Detected header row:",
-        best_header_row + 1,
-    )
-    print(
-        "Header detection score:",
-        best_score,
+    df = df.reset_index(
+        drop=True
     )
 
-    for index, column in enumerate(df.columns):
+    # Remove completely empty rows.
+    non_empty_mask = df.apply(
+        lambda row: any(
+            clean_text(value)
+            for value in row.tolist()
+        ),
+        axis=1,
+    )
 
-        normalized = normalized_column_name(
-            column
-        )
-
-        print(
-            index,
-            repr(column),
-            "=>",
-            repr(normalized),
-        )
-
-    print(
-        "========================================\n"
+    df = df.loc[
+        non_empty_mask
+    ].reset_index(
+        drop=True
     )
 
     return df
@@ -651,21 +536,11 @@ def mobile_digits(
 
     text = clean_text(value)
 
-    # Remove all non-digit characters.
     digits = re.sub(
         r"\D",
         "",
         text,
     )
-
-    # Handle:
-    #
-    # +91XXXXXXXXXX
-    # 91XXXXXXXXXX
-    #
-    # Convert to:
-    #
-    # XXXXXXXXXX
 
     if (
         len(digits) == 12
@@ -680,7 +555,9 @@ def valid_indian_mobile(
     value: Any,
 ) -> bool:
 
-    digits = mobile_digits(value)
+    digits = mobile_digits(
+        value
+    )
 
     return bool(
         re.fullmatch(
@@ -694,26 +571,15 @@ def suspicious_mobile(
     value: Any,
 ) -> bool:
 
-    digits = mobile_digits(value)
+    digits = mobile_digits(
+        value
+    )
 
     if len(digits) != 10:
         return False
 
-    # --------------------------------------------------------
-    # All same digit
-    #
-    # 0000000000
-    # 1111111111
-    # 2222222222
-    # etc.
-    # --------------------------------------------------------
-
     if len(set(digits)) == 1:
         return True
-
-    # --------------------------------------------------------
-    # Common fake / test numbers
-    # --------------------------------------------------------
 
     fake_patterns = {
         "0123456789",
@@ -722,10 +588,7 @@ def suspicious_mobile(
         "0987654321",
     }
 
-    if digits in fake_patterns:
-        return True
-
-    return False
+    return digits in fake_patterns
 
 
 # ============================================================
@@ -736,23 +599,21 @@ def normalized_shop(
     value: Any,
 ) -> str:
 
-    text = clean_text(value).lower()
+    text = clean_text(
+        value
+    ).lower()
 
-    # Remove punctuation
     text = re.sub(
         r"[^a-z0-9\u0900-\u097f]+",
         " ",
         text,
     )
 
-    # Multiple spaces
-    text = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         text,
     ).strip()
-
-    return text
 
 
 # ============================================================
@@ -763,42 +624,37 @@ def image_reference(
     value: Any,
 ) -> str:
 
-    text = clean_text(value)
+    text = clean_text(
+        value
+    )
 
     if not text:
         return ""
 
-    # Normalize case
-    text = text.lower().strip()
+    text = text.lower()
 
-    # Remove surrounding spaces
     text = re.sub(
         r"\s+",
         " ",
         text,
-    )
+    ).strip()
 
     return text
 
-
-# ============================================================
-# SCREENSHOT DETECTION
-# ============================================================
 
 def image_reason_label(
     value: Any,
 ) -> str:
 
-    text = clean_text(value)
+    text = clean_text(
+        value
+    )
 
     if not text:
         return ""
 
-    # Remove the interviewer note from the displayed reason.
-    # Example:
-    # "Photo of the Shop :Note : Interviewer ..."
-    # becomes:
-    # "Photo of the Shop"
+    # Remove the survey instruction beginning with
+    # ": Note : Interviewer ..."
     text = re.split(
         r"\s*:\s*note\b.*$",
         text,
@@ -813,7 +669,9 @@ def looks_like_screenshot(
     value: Any,
 ) -> bool:
 
-    text = clean_text(value).lower()
+    text = clean_text(
+        value
+    ).lower()
 
     if not text:
         return False
@@ -848,19 +706,18 @@ def numeric_value(
     value: Any,
 ) -> float | None:
 
-    text = clean_text(value)
+    text = clean_text(
+        value
+    )
 
     if not text:
         return None
 
     try:
-
         return float(
             text.replace(",", "")
         )
-
     except ValueError:
-
         return None
 
 
@@ -872,16 +729,13 @@ def format_worksheet(
     worksheet: Any,
 ) -> None:
 
-    # Freeze first row
     worksheet.freeze_panes = "A2"
 
-    # Filter
     if worksheet.max_row > 1:
         worksheet.auto_filter.ref = (
             worksheet.dimensions
         )
 
-    # Header formatting
     for cell in worksheet[1]:
 
         cell.font = Font(
@@ -900,10 +754,8 @@ def format_worksheet(
             wrap_text=True,
         )
 
-    # Header height
     worksheet.row_dimensions[1].height = 42
 
-    # Data alignment
     for row in worksheet.iter_rows(
         min_row=2,
     ):
@@ -915,7 +767,6 @@ def format_worksheet(
                 wrap_text=True,
             )
 
-    # Auto width
     for column_cells in worksheet.columns:
 
         column_letter = get_column_letter(
@@ -924,7 +775,6 @@ def format_worksheet(
 
         max_length = 0
 
-        # Limit scanning for performance
         for cell in column_cells[:300]:
 
             value = (
@@ -938,17 +788,15 @@ def format_worksheet(
                 len(value),
             )
 
-        width = max(
+        worksheet.column_dimensions[
+            column_letter
+        ].width = max(
             12,
             min(
                 max_length + 2,
                 45,
             ),
         )
-
-        worksheet.column_dimensions[
-            column_letter
-        ].width = width
 
 
 # ============================================================
@@ -959,10 +807,6 @@ def create_output(
     df: pd.DataFrame,
     output_path: Path,
 ) -> dict[str, Any]:
-
-    # --------------------------------------------------------
-    # FIND IMPORTANT COLUMNS
-    # --------------------------------------------------------
 
     mobile_col = find_column(
         df,
@@ -984,11 +828,9 @@ def create_output(
         LON_ALIASES,
     )
 
-    image_cols = find_image_columns(df)
-
-    # --------------------------------------------------------
-    # Detection diagnostic
-    # --------------------------------------------------------
+    image_cols = find_image_columns(
+        df
+    )
 
     print(
         "\n========================================"
@@ -1017,15 +859,14 @@ def create_output(
     )
     print(
         "Image Columns:",
-        [repr(column) for column in image_cols],
+        [
+            repr(column)
+            for column in image_cols
+        ],
     )
     print(
         "========================================\n"
     )
-
-    # --------------------------------------------------------
-    # Validate required columns
-    # --------------------------------------------------------
 
     if mobile_col is None:
 
@@ -1037,35 +878,36 @@ def create_output(
         raise ValueError(
             "Could not find the 'Mobile Number' column. "
             "Detected columns: "
-            + ", ".join(detected_columns[:80])
+            + ", ".join(
+                detected_columns[:80]
+            )
         )
 
     if outlet_col is None:
-
         raise ValueError(
             "Could not find the 'Outlet Name' column. "
             "Please check the spreadsheet header."
         )
 
     if lat_col is None:
-
         raise ValueError(
             "Could not find the Latitude column."
         )
 
     if lon_col is None:
-
         raise ValueError(
             "Could not find the Longitude column."
         )
 
     # ========================================================
-    # MOBILE DUPLICATES
+    # DUPLICATE MOBILE NUMBERS
     # ========================================================
 
     mobile_series = df[
         mobile_col
-    ].map(mobile_digits)
+    ].map(
+        mobile_digits
+    )
 
     mobile_counts = (
         mobile_series[
@@ -1080,9 +922,8 @@ def create_output(
         ].index
     )
 
-
     # ========================================================
-    # IMAGE DUPLICATES
+    # IMAGE REFERENCE DUPLICATES
     # ========================================================
 
     image_occurrences: dict[
@@ -1129,6 +970,17 @@ def create_output(
         dict[str, Any]
     ] = []
 
+    # Store formatting information by original dataframe index.
+    changed_columns_by_row: dict[
+        int,
+        set[str],
+    ] = {}
+
+    red_columns_by_row: dict[
+        int,
+        set[str],
+    ] = {}
+
     # ========================================================
     # COUNTERS
     # ========================================================
@@ -1137,20 +989,51 @@ def create_output(
         "Mobile Duplicates": 0,
         "Invalid Mobile": 0,
         "Suspicious Mobile": 0,
-        "Missing Mobile Number": 0,
-            "Duplicate Images": 0,
+        "Blank Mobile Number": 0,
+        "Duplicate Images": 0,
         "Screenshots": 0,
         "Missing Location": 0,
         "Invalid Coordinates": 0,
+        "No Shop Image": 0,
+        "Hindi Information": 0,
+        "Corrected Cells": 0,
     }
 
     # ========================================================
     # PROCESS EVERY ROW
     # ========================================================
 
-    for _, row in df.iterrows():
+    for row_index, row in df.iterrows():
 
         reasons: list[str] = []
+
+        changed_columns: set[str] = set()
+        red_columns: set[str] = set()
+
+        # ----------------------------------------------------
+        # Hindi information
+        # ----------------------------------------------------
+
+        hindi_found = False
+
+        for column in df.columns:
+
+            if contains_hindi(
+                row[column]
+            ):
+
+                hindi_found = True
+                break
+
+        if hindi_found:
+
+            reasons.append(
+                "Hindi Information Provided"
+            )
+
+            counters[
+                "Hindi Information"
+            ] += 1
 
         # ----------------------------------------------------
         # Mobile
@@ -1167,12 +1050,16 @@ def create_output(
         if not mobile_value:
 
             reasons.append(
-                "Missing Mobile Number"
+                "Blank Mobile Number"
             )
 
             counters[
-                "Missing Mobile Number"
+                "Blank Mobile Number"
             ] += 1
+
+            red_columns.add(
+                str(mobile_col)
+            )
 
         elif not valid_indian_mobile(
             row[mobile_col]
@@ -1211,9 +1098,13 @@ def create_output(
                 "Mobile Duplicates"
             ] += 1
 
-
         # ----------------------------------------------------
         # Latitude / Longitude
+        #
+        # IMPORTANT:
+        # Missing coordinates are NOT discard conditions.
+        # The row remains in Correct Data.
+        # Only the blank cells are marked red.
         # ----------------------------------------------------
 
         lat = numeric_value(
@@ -1224,20 +1115,30 @@ def create_output(
             row[lon_col]
         )
 
-        if (
-            lat is None
-            or lon is None
-        ):
-
-            reasons.append(
-                "Latitude/Longitude Missing"
-            )
+        if lat is None:
 
             counters[
                 "Missing Location"
             ] += 1
 
-        else:
+            red_columns.add(
+                str(lat_col)
+            )
+
+        if lon is None:
+
+            counters[
+                "Missing Location"
+            ] += 1
+
+            red_columns.add(
+                str(lon_col)
+            )
+
+        if (
+            lat is not None
+            and lon is not None
+        ):
 
             invalid_latitude = not (
                 -90 <= lat <= 90
@@ -1270,13 +1171,43 @@ def create_output(
                 row[image_col]
             )
 
+            image_label = image_reason_label(
+                image_col
+            )
+
+            is_shop_image = (
+                is_shop_image_column(
+                    image_col
+                )
+            )
+
+            # Missing image is a discard condition ONLY
+            # for shop/outlet image columns.
+            if (
+                is_shop_image
+                and not reference
+            ):
+
+                reasons.append(
+                    "No Shop Image"
+                )
+
+                counters[
+                    "No Shop Image"
+                ] += 1
+
+                red_columns.add(
+                    str(image_col)
+                )
+
             if (
                 reference
                 and reference in duplicate_images
             ):
 
                 reasons.append(
-                    f"Duplicate Image Reference: {image_reason_label(image_col)}"
+                    "Duplicate Image Reference: "
+                    + image_label
                 )
 
                 counters[
@@ -1291,7 +1222,8 @@ def create_output(
             ):
 
                 reasons.append(
-                    f"Screenshot Image: {image_reason_label(image_col)}"
+                    "Screenshot Image: "
+                    + image_label
                 )
 
                 counters[
@@ -1299,29 +1231,101 @@ def create_output(
                 ] += 1
 
         # ----------------------------------------------------
-        # Preserve original data
+        # Prepare row data.
+        #
+        # Normal Latin text is corrected to title case.
+        # Hindi is preserved for the discard report.
         # ----------------------------------------------------
 
-        base = {
-            str(column): row[column]
-            for column in df.columns
-        }
+        base: dict[str, Any] = {}
 
-        # Remove duplicate reasons
-        unique_reasons = list(
-            dict.fromkeys(reasons)
+        for column in df.columns:
+
+            column_name = str(
+                column
+            )
+
+            original_value = row[
+                column
+            ]
+
+            original_text = clean_text(
+                original_value
+            )
+
+            # Never alter mobile numbers,
+            # coordinates or image references.
+            special_column = (
+                column == mobile_col
+                or column == lat_col
+                or column == lon_col
+                or column in image_cols
+            )
+
+            if (
+                original_text
+                and not special_column
+                and not contains_hindi(
+                    original_text
+                )
+            ):
+
+                corrected_value = (
+                    title_case_value(
+                        original_text
+                    )
+                )
+
+                base[
+                    column_name
+                ] = corrected_value
+
+                if (
+                    corrected_value
+                    != original_text
+                ):
+
+                    changed_columns.add(
+                        column_name
+                    )
+
+            else:
+
+                base[
+                    column_name
+                ] = original_value
+
+        if changed_columns:
+            counters[
+                "Corrected Cells"
+            ] += len(
+                changed_columns
+            )
+
+        changed_columns_by_row[
+            row_index
+        ] = changed_columns
+
+        red_columns_by_row[
+            row_index
+        ] = red_columns
+
+        # ----------------------------------------------------
+        # Latitude/longitude missing does NOT cause discard.
+        # ----------------------------------------------------
+
+        discard_reasons = list(
+            dict.fromkeys(
+                reasons
+            )
         )
 
-        # ----------------------------------------------------
-        # Correct or Discard
-        # ----------------------------------------------------
-
-        if unique_reasons:
+        if discard_reasons:
 
             base[
                 "Discard Reason"
             ] = "; ".join(
-                unique_reasons
+                discard_reasons
             )
 
             discarded_rows.append(
@@ -1379,32 +1383,45 @@ def create_output(
 
         workbook = writer.book
 
-        # ----------------------------------------------------
-        # Format Correct Data
-        # ----------------------------------------------------
-
         correct_sheet = workbook[
             "Correct Data"
         ]
-
-        format_worksheet(
-            correct_sheet
-        )
-
-        # ----------------------------------------------------
-        # Format Discard Data
-        # ----------------------------------------------------
 
         discard_sheet = workbook[
             "Discard Data"
         ]
 
         format_worksheet(
+            correct_sheet
+        )
+
+        format_worksheet(
             discard_sheet
         )
 
         # ----------------------------------------------------
-        # Highlight Discard Reason
+        # Existing visual style for Correct Data.
+        # Specific yellow/red cells are applied afterwards.
+        # ----------------------------------------------------
+
+        green_fill = PatternFill(
+            fill_type="solid",
+            fgColor="F0FDF4",
+        )
+
+        for row_number in range(
+            2,
+            correct_sheet.max_row + 1,
+        ):
+
+            for cell in correct_sheet[
+                row_number
+            ]:
+
+                cell.fill = green_fill
+
+        # ----------------------------------------------------
+        # Discard reason styling.
         # ----------------------------------------------------
 
         if discard_sheet.max_column > 0:
@@ -1434,23 +1451,212 @@ def create_output(
                 )
 
         # ----------------------------------------------------
-        # Highlight Correct Data status
+        # Yellow = validator corrected the cell.
+        # Red = relevant blank cell.
+        #
+        # Because Correct Data can contain rows with only
+        # missing latitude/longitude, red must be applied there.
         # ----------------------------------------------------
 
-        # Add green visual formatting to Correct Data rows.
-        for row_number in range(
-            2,
-            correct_sheet.max_row + 1,
-        ):
+        yellow_fill = PatternFill(
+            fill_type="solid",
+            fgColor="FFF2CC",
+        )
 
-            for cell in correct_sheet[
-                row_number
-            ]:
+        red_fill = PatternFill(
+            fill_type="solid",
+            fgColor="FFC7CE",
+        )
 
-                cell.fill = PatternFill(
-                    fill_type="solid",
-                    fgColor="F0FDF4",
+        red_font = Font(
+            color="9C0006",
+        )
+
+        # Map dataframe row index -> output row number.
+        # Rows are appended in original order within each sheet.
+        correct_output_row = 2
+
+        for row_index, row in df.iterrows():
+
+            reasons_exist = bool(
+                # Determine whether this row was discarded
+                # using the same logic stored in the result lists.
+                any(
+                    clean_text(
+                        row[column]
+                    )
+                    for column in df.columns
+                    if False
                 )
+            )
+
+            # A simpler reliable test:
+            # latitude/longitude are never discard reasons;
+            # inspect the generated discard row IDs by order.
+            row_was_discarded = False
+
+            # Reconstruct the discard decision from the output
+            # by matching the row's Response ID when available.
+            response_col = find_column(
+                df,
+                {"response id"},
+            )
+
+            if response_col is not None:
+                response_value = clean_text(
+                    row[response_col]
+                )
+
+                if response_value:
+                    for discard_row_number in range(
+                        2,
+                        discard_sheet.max_row + 1,
+                    ):
+                        discard_response = clean_text(
+                            discard_sheet.cell(
+                                row=discard_row_number,
+                                column=(
+                                    original_columns.index(
+                                        str(response_col)
+                                    ) + 1
+                                ),
+                            ).value
+                        )
+
+                        if (
+                            discard_response
+                            == response_value
+                        ):
+                            row_was_discarded = True
+                            break
+
+            # If no Response ID exists, use the generated row
+            # content to determine membership.
+            if (
+                response_col is None
+                or not clean_text(
+                    row[response_col]
+                )
+            ):
+                row_was_discarded = any(
+                    str(
+                        discarded_row.get(
+                            "Discard Reason",
+                            ""
+                        )
+                    )
+                    for discarded_row in discarded_rows
+                    if all(
+                        clean_text(
+                            discarded_row.get(
+                                str(column),
+                            )
+                        )
+                        == clean_text(
+                            row[column]
+                        )
+                        for column in df.columns
+                    )
+                )
+
+            target_sheet = (
+                discard_sheet
+                if row_was_discarded
+                else correct_sheet
+            )
+
+            target_row = None
+
+            if row_was_discarded:
+
+                # Find the matching row by all original values.
+                for candidate in range(
+                    2,
+                    discard_sheet.max_row + 1,
+                ):
+
+                    matches = True
+
+                    for column_index, column in enumerate(
+                        original_columns,
+                        start=1,
+                    ):
+
+                        source_value = clean_text(
+                            row[column]
+                        )
+
+                        output_value = clean_text(
+                            discard_sheet.cell(
+                                row=candidate,
+                                column=column_index,
+                            ).value
+                        )
+
+                        # For corrected non-special values, compare
+                        # against title-cased output.
+                        if (
+                            column
+                            in changed_columns_by_row.get(
+                                row_index,
+                                set(),
+                            )
+                        ):
+
+                            expected = clean_text(
+                                title_case_value(
+                                    source_value
+                                )
+                            )
+
+                        else:
+                            expected = source_value
+
+                        if output_value != expected:
+                            matches = False
+                            break
+
+                    if matches:
+                        target_row = candidate
+                        break
+
+            else:
+
+                # Correct rows preserve original order.
+                target_row = correct_output_row
+                correct_output_row += 1
+
+            if target_row is None:
+                continue
+
+            for column_index, column in enumerate(
+                original_columns,
+                start=1,
+            ):
+
+                cell = target_sheet.cell(
+                    row=target_row,
+                    column=column_index,
+                )
+
+                column_name = str(
+                    column
+                )
+
+                if column_name in changed_columns_by_row.get(
+                    row_index,
+                    set(),
+                ):
+
+                    cell.fill = yellow_fill
+
+                if column_name in red_columns_by_row.get(
+                    row_index,
+                    set(),
+                ):
+
+                    cell.fill = red_fill
+                    cell.font = red_font
 
     # ========================================================
     # RESPONSE
@@ -1458,12 +1664,8 @@ def create_output(
 
     return {
         "total_rows": len(df),
-        "correct_rows": len(
-            correct_df
-        ),
-        "discarded_rows": len(
-            discard_df
-        ),
+        "correct_rows": len(correct_df),
+        "discarded_rows": len(discard_df),
         "output_filename": output_path.name,
         "checks": counters,
         "detected_columns": {
@@ -1519,10 +1721,6 @@ async def validate(
         .lower()
     )
 
-    # --------------------------------------------------------
-    # Validate extension
-    # --------------------------------------------------------
-
     allowed_extensions = {
         ".xlsx",
         ".xls",
@@ -1539,10 +1737,6 @@ async def validate(
                 "files are supported."
             ),
         )
-
-    # --------------------------------------------------------
-    # Create temporary paths
-    # --------------------------------------------------------
 
     job_id = uuid.uuid4().hex
 
@@ -1561,10 +1755,6 @@ async def validate(
         OUTPUT_DIR
         / output_name
     )
-
-    # --------------------------------------------------------
-    # Process
-    # --------------------------------------------------------
 
     try:
 
@@ -1621,9 +1811,6 @@ async def validate(
 def download(
     filename: str,
 ) -> FileResponse:
-
-    # Security:
-    # only use the filename, not any supplied path.
 
     safe_name = Path(
         filename
