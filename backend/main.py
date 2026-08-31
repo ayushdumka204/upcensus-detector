@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import re
 import uuid
 from pathlib import Path
@@ -97,6 +98,18 @@ IMAGE_HINTS = (
 )
 
 
+# These response metadata columns are NEVER cleaned, corrected,
+# title-cased, Hindi-checked, or highlighted as changed.
+# Their values must remain exactly as they appeared in the input.
+PROTECTED_METADATA_ALIASES = {
+    "response id",
+    "response start time",
+    "response completion time",
+    "ip address",
+    "collector name",
+}
+
+
 # ============================================================
 # TEXT HELPERS
 # ============================================================
@@ -148,6 +161,141 @@ def normalized_column_name(value: Any) -> str:
         " ",
         text,
     ).strip()
+
+
+def is_protected_metadata_column(column: Any) -> bool:
+    """Return True for response metadata columns that must stay untouched."""
+
+    return (
+        normalized_column_name(column)
+        in PROTECTED_METADATA_ALIASES
+    )
+
+
+def correction_key(value: Any) -> str:
+    """Normalize a text value for fuzzy spelling comparison."""
+
+    text = clean_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def best_reference_correction(
+    value: Any,
+    candidates: list[Any],
+) -> Any:
+    """
+    Prefer a clearly matching value already present in the same
+    spreadsheet. This helps correct misspellings such as:
+
+        Relwway Stesion -> Railway Station
+        Bindki Men Road -> Bindki Main Road
+
+    Only strong matches are accepted, so arbitrary short values are
+    not replaced.
+    """
+
+    original = clean_text(value)
+
+    if (
+        not original
+        or contains_hindi(original)
+        or len(original) < 5
+    ):
+        return value
+
+    key = correction_key(original)
+
+    if not key:
+        return value
+
+    best_value: Any = value
+    best_score = 0.0
+
+    seen: set[str] = set()
+
+    for candidate in candidates:
+
+        candidate_text = clean_text(candidate)
+
+        if (
+            not candidate_text
+            or contains_hindi(candidate_text)
+            or candidate_text.lower() == original.lower()
+            or len(candidate_text) < 5
+        ):
+            continue
+
+        candidate_key = correction_key(candidate_text)
+
+        if (
+            not candidate_key
+            or candidate_key in seen
+        ):
+            continue
+
+        seen.add(candidate_key)
+
+        # Avoid matching values that are wildly different in size.
+        length_ratio = min(
+            len(key),
+            len(candidate_key),
+        ) / max(
+            len(key),
+            len(candidate_key),
+        )
+
+        if length_ratio < 0.70:
+            continue
+
+        whole_score = difflib.SequenceMatcher(
+            None,
+            key,
+            candidate_key,
+        ).ratio()
+
+        original_words = key.split()
+        candidate_words = candidate_key.split()
+
+        # Word-level similarity is useful for real-world typos where
+        # several words are individually close but the whole sentence
+        # score becomes lower because of transposed/misspelled letters.
+        word_scores: list[float] = []
+
+        for original_word in original_words:
+            if not candidate_words:
+                break
+
+            word_scores.append(
+                max(
+                    difflib.SequenceMatcher(
+                        None,
+                        original_word,
+                        candidate_word,
+                    ).ratio()
+                    for candidate_word in candidate_words
+                )
+            )
+
+        average_word_score = (
+            sum(word_scores) / len(word_scores)
+            if word_scores
+            else 0.0
+        )
+
+        score = max(
+            whole_score,
+            average_word_score,
+        )
+
+        if score > best_score:
+            best_score = score
+            best_value = candidate_text
+
+    if best_score >= 0.70:
+        return best_value
+
+    return value
 
 
 def title_case_value(value: Any) -> Any:
@@ -1018,6 +1166,9 @@ def create_output(
 
         for column in df.columns:
 
+            if is_protected_metadata_column(column):
+                continue
+
             if contains_hindi(
                 row[column]
             ):
@@ -1253,10 +1404,11 @@ def create_output(
                 original_value
             )
 
-            # Never alter mobile numbers,
+            # Never alter response metadata, mobile numbers,
             # coordinates or image references.
             special_column = (
-                column == mobile_col
+                is_protected_metadata_column(column)
+                or column == mobile_col
                 or column == lat_col
                 or column == lon_col
                 or column in image_cols
@@ -1270,11 +1422,22 @@ def create_output(
                 )
             ):
 
-                corrected_value = (
-                    title_case_value(
+                # First use a strong same-sheet reference value when
+                # one exists; otherwise apply normal title casing.
+                same_column_candidates = [
+                    row[column]
+                    for _, row in df.iterrows()
+                ]
+
+                corrected_value = best_reference_correction(
+                    original_text,
+                    same_column_candidates,
+                )
+
+                if clean_text(corrected_value).lower() == original_text.lower():
+                    corrected_value = title_case_value(
                         original_text
                     )
-                )
 
                 base[
                     column_name
@@ -1603,10 +1766,23 @@ def create_output(
                             )
                         ):
 
-                            expected = clean_text(
-                                title_case_value(
+                            candidate_values = [
+                                source_row[column]
+                                for _, source_row in df.iterrows()
+                            ]
+
+                            corrected_expected = best_reference_correction(
+                                source_value,
+                                candidate_values,
+                            )
+
+                            if clean_text(corrected_expected).lower() == source_value.lower():
+                                corrected_expected = title_case_value(
                                     source_value
                                 )
+
+                            expected = clean_text(
+                                corrected_expected
                             )
 
                         else:
