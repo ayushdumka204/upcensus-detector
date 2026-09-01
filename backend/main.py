@@ -108,26 +108,32 @@ PROTECTED_METADATA_ALIASES = {
 # ============================================================
 # PROTECTED ADDRESS COLUMN
 # ============================================================
-# Address values must NEVER be spelling-corrected, capitalized,
-# normalized, or otherwise modified.
+# Location [Address] is completely untouched.
+# No spelling, wording, capitalization, normalization,
+# yellow correction highlight, or red validation highlight.
 ADDRESS_COLUMN_ALIASES = {
     "address",
     "shop address",
     "outlet address",
     "location [address]",
+    "location address",
 }
 
 
 def is_address_column(column: Any) -> bool:
-    """Return True when the column is an address field."""
-    try:
-        return normalized_column_name(column) in ADDRESS_COLUMN_ALIASES
-    except (NameError, TypeError, AttributeError):
-        return str(column).strip().lower() in ADDRESS_COLUMN_ALIASES
+    normalized_column = normalized_column_name(column)
+
+    normalized_aliases = {
+        normalized_column_name(alias)
+        for alias in ADDRESS_COLUMN_ALIASES
+    }
+
+    return normalized_column in normalized_aliases
 
 
 def is_protected_metadata_column(column: Any) -> bool:
     return normalized_column_name(column) in PROTECTED_METADATA_ALIASES
+
 
 
 # ============================================================
@@ -1736,8 +1742,12 @@ def create_output(
             ):
                 column_name = str(column)
 
-                # Metadata columns remain untouched by validation highlighting.
-                if is_protected_metadata_column(column):
+                # Metadata and Address columns are completely untouched
+                # by validation highlighting.
+                if (
+                    is_protected_metadata_column(column)
+                    or is_address_column(column)
+                ):
                     continue
 
                 cell = target_sheet.cell(
