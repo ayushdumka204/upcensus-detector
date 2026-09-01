@@ -1,4 +1,4 @@
-
+from __future__ import annotations
 
 import re
 import uuid
@@ -164,10 +164,8 @@ def normalized_column_name(value: Any) -> str:
 
 def title_case_value(value: Any) -> Any:
     """
-    Correct ordinary Latin text to normal title case.
-
-    Hindi/Devanagari text is deliberately not changed because
-    Hindi rows are discarded separately.
+    Sentence-style capitalization for ordinary text:
+    only the first letter of the first word is uppercase.
     """
 
     text = clean_text(value)
@@ -175,14 +173,73 @@ def title_case_value(value: Any) -> Any:
     if not text or contains_hindi(text):
         return value
 
-    return re.sub(
-        r"\b([A-Za-z])([A-Za-z']*)\b",
-        lambda match: (
-            match.group(1).upper()
-            + match.group(2).lower()
-        ),
-        text,
+    return text[:1].upper() + text[1:].lower()
+
+
+def is_person_name_column(column: Any) -> bool:
+    """
+    Detect person/name columns.
+
+    Every word in a person name gets its first letter capitalized.
+    Shop/outlet/store names are deliberately excluded because those
+    use sentence-style capitalization instead.
+    """
+
+    normalized = normalized_column_name(column)
+
+    if "name" not in normalized:
+        return False
+
+    excluded = (
+        "outlet",
+        "shop",
+        "store",
+        "business",
     )
+
+    return not any(
+        word in normalized
+        for word in excluded
+    )
+
+
+def person_name_value(value: Any) -> Any:
+    """
+    Person-name capitalization:
+        rahul kumar -> Rahul Kumar
+        RAHUL KUMAR -> Rahul Kumar
+
+    Only the first character of each name word is uppercase.
+    """
+
+    text = clean_text(value)
+
+    if not text or contains_hindi(text):
+        return value
+
+    return " ".join(
+        word[:1].upper() + word[1:].lower()
+        if word
+        else word
+        for word in text.split()
+    )
+
+
+def corrected_text_value(
+    value: Any,
+    column: Any,
+) -> Any:
+    """
+    Apply the requested capitalization rule:
+    - person/name columns: first letter of EVERY name word uppercase
+    - outlet/shop and all other ordinary text: only FIRST word's
+      first letter uppercase
+    """
+
+    if is_person_name_column(column):
+        return person_name_value(value)
+
+    return title_case_value(value)
 
 
 # ============================================================
@@ -934,41 +991,138 @@ def create_output(
         ].index
     )
 
+    # --------------------------------------------------------
+    # Duplicate mobile representative
+    #
+    # Normally the FIRST occurrence is kept.
+    # If the first occurrence is missing latitude/longitude
+    # and a later duplicate has both coordinates, keep that
+    # later row instead. Every other duplicate is discarded.
+    # --------------------------------------------------------
+
+    mobile_occurrences: dict[str, list[int]] = {}
+
+    for row_index, mobile in mobile_series.items():
+        if mobile:
+            mobile_occurrences.setdefault(
+                mobile,
+                [],
+            ).append(row_index)
+
+    duplicate_mobile_keep_row: dict[str, int] = {}
+
+    for mobile in duplicate_mobiles:
+        occurrences = mobile_occurrences.get(
+            mobile,
+            [],
+        )
+
+        if not occurrences:
+            continue
+
+        keep_row = occurrences[0]
+
+        first_lat = numeric_value(
+            df.iloc[keep_row][lat_col]
+        )
+        first_lon = numeric_value(
+            df.iloc[keep_row][lon_col]
+        )
+
+        # Special case requested:
+        # if first duplicate has missing coordinates, prefer
+        # the first later duplicate that has both coordinates.
+        if (
+            first_lat is None
+            or first_lon is None
+        ):
+            for candidate_row in occurrences[1:]:
+                candidate_lat = numeric_value(
+                    df.iloc[candidate_row][lat_col]
+                )
+                candidate_lon = numeric_value(
+                    df.iloc[candidate_row][lon_col]
+                )
+
+                if (
+                    candidate_lat is not None
+                    and candidate_lon is not None
+                ):
+                    keep_row = candidate_row
+                    break
+
+        duplicate_mobile_keep_row[
+            mobile
+        ] = keep_row
+
     # ========================================================
     # IMAGE REFERENCE DUPLICATES
     # ========================================================
 
     image_occurrences: dict[
         str,
-        int,
+        list[tuple[int, str]],
     ] = {}
 
-    for column in image_cols:
+    for image_column in image_cols:
 
-        for value in df[column]:
+        for row_index, value in df[
+            image_column
+        ].items():
 
             reference = image_reference(
                 value
             )
 
             if reference:
-
-                image_occurrences[
-                    reference
-                ] = (
-                    image_occurrences.get(
-                        reference,
-                        0,
+                image_occurrences.setdefault(
+                    reference,
+                    [],
+                ).append(
+                    (
+                        row_index,
+                        image_column,
                     )
-                    + 1
                 )
 
     duplicate_images = {
         reference
-        for reference, count
+        for reference, occurrences
         in image_occurrences.items()
-        if count > 1
+        if len(occurrences) > 1
     }
+
+    # Same image in the SAME image column:
+    # keep only the first occurrence.
+    same_column_image_keep: dict[
+        str,
+        tuple[int, str],
+    ] = {}
+
+    # Same image used in DIFFERENT image columns:
+    # discard every occurrence because the image was used
+    # for the wrong/different product field as well.
+    cross_column_duplicate_images: set[str] = set()
+
+    for reference in duplicate_images:
+
+        occurrences = image_occurrences[
+            reference
+        ]
+
+        columns_used = {
+            column
+            for _, column in occurrences
+        }
+
+        if len(columns_used) > 1:
+            cross_column_duplicate_images.add(
+                reference
+            )
+        else:
+            same_column_image_keep[
+                reference
+            ] = occurrences[0]
 
     # ========================================================
     # RESULT CONTAINERS
@@ -1106,6 +1260,9 @@ def create_output(
         if (
             mobile
             and mobile in duplicate_mobiles
+            and duplicate_mobile_keep_row.get(
+                mobile
+            ) != row_index
         ):
 
             reasons.append(
@@ -1222,15 +1379,36 @@ def create_output(
                 reference
                 and reference in duplicate_images
             ):
-
-                reasons.append(
-                    "Duplicate Image Reference: "
-                    + image_label
+                occurrences = image_occurrences.get(
+                    reference,
+                    [],
                 )
 
-                counters[
-                    "Duplicate Images"
-                ] += 1
+                current_occurrence = (
+                    row_index,
+                    image_col,
+                )
+
+                discard_duplicate_image = (
+                    reference
+                    in cross_column_duplicate_images
+                    or (
+                        same_column_image_keep.get(
+                            reference
+                        )
+                        != current_occurrence
+                    )
+                )
+
+                if discard_duplicate_image:
+                    reasons.append(
+                        "Duplicate Image Reference: "
+                        + image_label
+                    )
+
+                    counters[
+                        "Duplicate Images"
+                    ] += 1
 
             if (
                 reference
@@ -1251,7 +1429,7 @@ def create_output(
         # ----------------------------------------------------
         # Prepare row data.
         #
-        # Normal Latin text is corrected to title case.
+        # Normal Latin text is corrected using the requested capitalization rules.
         # Hindi is preserved for the discard report.
         # ----------------------------------------------------
 
@@ -1290,8 +1468,9 @@ def create_output(
             ):
 
                 corrected_value = (
-                    title_case_value(
-                        original_text
+                    corrected_text_value(
+                        original_text,
+                        column,
                     )
                 )
 
