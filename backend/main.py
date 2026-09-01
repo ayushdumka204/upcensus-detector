@@ -1462,6 +1462,7 @@ def create_output(
                 original_text
                 and not special_column
                 and not is_protected_metadata_column(column)
+                and not is_address_column(column)
                 and not contains_hindi(
                     original_text
                 )
