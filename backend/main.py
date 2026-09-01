@@ -114,6 +114,7 @@ ADDRESS_COLUMN_ALIASES = {
     "address",
     "shop address",
     "outlet address",
+    "location [address]",
 }
 
 
