@@ -105,6 +105,26 @@ PROTECTED_METADATA_ALIASES = {
     "collector name",
 }
 
+# ============================================================
+# PROTECTED ADDRESS COLUMN
+# ============================================================
+# Address values must NEVER be spelling-corrected, capitalized,
+# normalized, or otherwise modified.
+ADDRESS_COLUMN_ALIASES = {
+    "address",
+    "shop address",
+    "outlet address",
+}
+
+
+def is_address_column(column: Any) -> bool:
+    """Return True when the column is an address field."""
+    try:
+        return normalized_column_name(column) in ADDRESS_COLUMN_ALIASES
+    except (NameError, TypeError, AttributeError):
+        return str(column).strip().lower() in ADDRESS_COLUMN_ALIASES
+
+
 def is_protected_metadata_column(column: Any) -> bool:
     return normalized_column_name(column) in PROTECTED_METADATA_ALIASES
 
